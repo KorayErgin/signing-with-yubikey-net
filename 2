@@ -1,129 +1,402 @@
 using System;
 using System.IO;
+using System.Net;
 using System.Runtime.InteropServices;
 using System.Security.Cryptography;
 using System.Security.Cryptography.X509Certificates;
 using System.Text;
+using System.Windows.Forms;
 
-class Program
+static class Program
 {
-    // ---- PIV sabitleri ----
-    static readonly byte[] PivAid    = { 0xA0,0x00,0x00,0x03,0x08,0x00,0x00,0x10,0x00,0x01,0x00 };
-    const byte Slot9C                = 0x9C;                // Digital Signature
-    static readonly byte[] OidCert9C = { 0x5F, 0xC1, 0x0B }; // GET DATA selector
-
+    [STAThread]
     static void Main()
     {
-        try
+        Application.EnableVisualStyles();
+        Application.SetCompatibleTextRenderingDefault(false);
+        Application.Run(new MainForm());
+    }
+}
+
+public class MainForm : Form
+{
+    // --- UI ---
+    TextBox txtServer, txtUserId, txtMessage, txtLog;
+    Button btnProvision, btnRegister, btnSignSend;
+
+    // --- PIV sabitleri ---
+    static readonly byte[] PivAid     = { 0xA0,0x00,0x00,0x03,0x08,0x00,0x00,0x10,0x00,0x01,0x00 };
+    const  byte   Slot9C              = 0x9C;                 // Digital Signature slot
+    static readonly byte[] OidCert9C  = { 0x5F, 0xC1, 0x0B }; // GET/PUT selector
+
+    // Varsayılan 24-byte 3DES Management Key (DEĞİŞTİRDİYSEN kendi key’ini kullan!)
+    static readonly byte[] DefaultMgmtKey = {
+        0x01,0x02,0x03,0x04,0x05,0x06,0x07,0x08,
+        0x01,0x02,0x03,0x04,0x05,0x06,0x07,0x08,
+        0x01,0x02,0x03,0x04,0x05,0x06,0x07,0x08
+    };
+
+    public MainForm()
+    {
+        Text = "YubiKey PIV – Provision + Register + Sign (WinForms, .NET 4.6)";
+        Width = 980; Height = 720;
+
+        var pnl = new Panel { Dock = DockStyle.Top, Height = 120, Padding = new Padding(10) };
+        var lblServer = new Label { Text = "Server Base URL:", Left = 10, Top = 12, Width = 130 };
+        txtServer = new TextBox { Left = 150, Top = 10, Width = 420, Text = "http://localhost:8080" };
+        var lblUser = new Label { Text = "userId:", Left = 10, Top = 45, Width = 130 };
+        txtUserId = new TextBox { Left = 150, Top = 43, Width = 200, Text = "koray" };
+        var lblMsg  = new Label { Text = "Mesaj:", Left = 10, Top = 78, Width = 130 };
+        txtMessage  = new TextBox { Left = 150, Top = 76, Width = 800, Text = "imzalanacak metin" };
+
+        btnProvision = new Button { Left = 580, Top = 8, Width = 200, Height=28, Text = "Provision 9C (Generate Cert)" };
+        btnRegister  = new Button { Left = 790, Top = 8, Width = 140, Height=28, Text = "Register" };
+        btnSignSend  = new Button { Left = 790, Top = 42, Width = 140, Height=28, Text = "Sign + Send" };
+
+        pnl.Controls.AddRange(new Control[] { lblServer, txtServer, lblUser, txtUserId, lblMsg, txtMessage, btnProvision, btnRegister, btnSignSend });
+
+        txtLog = new TextBox { Dock = DockStyle.Fill, Multiline = true, ScrollBars = ScrollBars.Vertical, Font = new System.Drawing.Font("Consolas", 10), ReadOnly = true };
+
+        Controls.Add(txtLog);
+        Controls.Add(pnl);
+
+        btnProvision.Click += (s, e) => SafeRun(DoProvision);
+        btnRegister.Click  += (s, e) => SafeRun(DoRegister);
+        btnSignSend.Click  += (s, e) => SafeRun(DoSignSend);
+
+        Log("Hazır. Adım sırası: Provision → Register → Sign+Send");
+    }
+
+    void SafeRun(Action act)
+    {
+        try { act(); }
+        catch (Exception ex) { Log("HATA:\r\n" + ex + "\r\n"); }
+    }
+    void Log(string s) { txtLog.AppendText(s + "\r\n"); }
+    static string Must(string s, string name) { if (string.IsNullOrWhiteSpace(s)) throw new Exception(name + " boş olamaz."); return s.Trim(); }
+
+    // ================== ACTIONS ==================
+
+    // 1) Provision: Admin auth → Generate → Self-signed (TBS'i kartla imzala) → Put cert
+    void DoProvision()
+    {
+        string userId = Must(txtUserId.Text, "userId");
+
+        // PIN iste (TBS imzalatmak için GA çağıracağız)
+        string pin = PromptPin();
+        using (var sc = SmartCard.ConnectFirstPresent())
         {
-            Console.Write("PIV PIN (örn. 123456): ");
-            string pin = ReadHidden();
-            string message = "imzalanacak metin";
+            Log("[*] Reader: " + sc.ReaderName + " | Protocol: " + (sc.ActiveProtocol == WinSCard.SCARD_PROTOCOL_T1 ? "T=1" : "T=0"));
 
-            using (var sc = SmartCard.ConnectFirstPresent())
-            {
-                Console.WriteLine("[*] Reader : " + sc.ReaderName);
-                Console.WriteLine("[*] Protocol: " + (sc.ActiveProtocol == WinSCard.SCARD_PROTOCOL_T1 ? "T=1" : "T=0"));
+            // SELECT PIV
+            ApduOk(sc.Transmit(new Apdu(0x00,0xA4,0x04,0x00, PivAid)));
+            Log("[*] SELECT PIV OK");
 
-                // 1) SELECT PIV
-                ApduOk(sc.Transmit(new Apdu(0x00, 0xA4, 0x04, 0x00, PivAid)));
+            // Admin auth (3DES) - DefaultMgmtKey yerine kendi key’in varsa onu ver
+            PivAdminAuthenticate_TDES(sc, DefaultMgmtKey);
+            Log("[*] Admin auth OK");
 
-                // 2) 9C sertifika
-                byte[] certDer = GetCert9C(sc);
-                var cert = new X509Certificate2(certDer);
-                Console.WriteLine("[*] 9C Subject       : " + cert.Subject);
-                Console.WriteLine("[*] 9C PublicKey OID : " + cert.PublicKey.Oid.Value);
-                Console.WriteLine("\n----- 9C CERT PEM -----\n" + ToPem("CERTIFICATE", certDer));
+            // 9C RSA2048 anahtar üret
+            GenerateKey9C_RSA2048(sc, out var modulus, out var exponent);
+            Log("[*] Generated RSA2048 on-card. nLen=" + modulus.Length + " eLen=" + exponent.Length);
 
-                bool isRsa = cert.PublicKey.Oid.Value == "1.2.840.113549.1.1.1"; // rsaEncryption
+            // PIN VERIFY (global PIN, P2=0x80) — TBS'i imzalayabilmek için
+            ApduOk(sc.Transmit(new Apdu(0x00, 0x20, 0x00, 0x80, Encoding.ASCII.GetBytes(pin))));
+            Log("[*] PIN verify OK");
 
-                // 3) PIN VERIFY (global PIN, P2=0x80)
-                ApduOk(sc.Transmit(new Apdu(0x00, 0x20, 0x00, 0x80, Encoding.ASCII.GetBytes(pin))));
+            // Self-signed X.509: TBS'i oluştur, kartla imzala, sertifikayı derle
+            byte[] certDer = BuildSelfSignedCertDer_RSA_SHA256(
+                subjectCN: userId,
+                modulus: modulus,
+                exponent: exponent,
+                signer: (tbs) => SignTbsWithCard_RSA_PKCS1(sc, tbs)
+            );
+            Log("[*] Cert built (self-signed, signed-by-card). DER len=" + certDer.Length);
 
-                // 4) GENERAL AUTHENTICATE ile imza
-                byte[] dataToSign;
-                if (isRsa)
-                {
-                    byte[] hash = SHA256.Create().ComputeHash(Encoding.UTF8.GetBytes(message));
-                    dataToSign = BuildDigestInfoSha256(hash); // RSA PKCS#1 v1.5 DigestInfo
-                }
-                else
-                {
-                    // EC için GA ham hash ister (P-256 varsayıyoruz)
-                    dataToSign = SHA256.Create().ComputeHash(Encoding.UTF8.GetBytes(message));
-                }
+            // PUT DATA 5FC10B
+            PutCertificate9C(sc, certDer);
+            Log("[*] 9C certificate installed.");
 
-                byte[] ga = Tlv(0x7C, Tlv(0x82, dataToSign));
-                var resp = sc.Transmit(new Apdu(0x00, 0x87, 0x00, Slot9C, ga));
-                ApduOk(resp);
-
-                byte[] sig = ExtractNestedTlv(resp.Data, 0x7C, 0x82);
-                if (sig == null) throw new Exception("İmza TLV bulunamadı.");
-                string sigB64 = Convert.ToBase64String(sig);
-                Console.WriteLine("\n[*] Signature (Base64):\n" + sigB64);
-
-                // 5) Lokal doğrulama (RSA)
-                if (isRsa)
-                {
-                    bool ok = VerifyLocalRsa(cert, message, sig);
-                    Console.WriteLine("[VERIFY-LOCAL] " + (ok ? "OK" : "FAIL"));
-                }
-                else
-                {
-                    Console.WriteLine("[NOT] EC key: .NET 4.6 lokal ECDSA doğrulama örneği bu dosyada yok.");
-                }
-            }
-        }
-        catch (Exception ex)
-        {
-            Console.WriteLine("HATA: " + ex);
+            // Kontrol: GET DATA ile tekrar oku
+            byte[] certDer2 = GetCert9C(sc);
+            Log("[*] Read-back OK. Cert len=" + certDer2.Length + "\r\n" + ToPem("CERTIFICATE", certDer2));
         }
     }
 
-    // ---- 9C sertifika GET DATA ----
+    // 2) Register: 9C cert'i oku → backend'e gönder
+    void DoRegister()
+    {
+        string baseUrl = Must(txtServer.Text, "Server URL");
+        string userId  = Must(txtUserId.Text, "userId");
+        using (var sc = SmartCard.ConnectFirstPresent())
+        {
+            Log("[*] Reader: " + sc.ReaderName);
+            ApduOk(sc.Transmit(new Apdu(0x00,0xA4,0x04,0x00, PivAid)));
+            byte[] certDer = GetCert9C(sc);
+            string pem = ToPem("CERTIFICATE", certDer);
+
+            string json = "{\"userId\":\""+Esc(userId)+"\",\"certificatePem\":\""+Esc(pem)+"\"}";
+            string resp = HttpPostJson(baseUrl.TrimEnd('/')+"/api/register-key", json);
+            Log("[REGISTER] " + resp);
+        }
+    }
+
+    // 3) Sign + Send: PIN → GA(9C) ile imza → backend'e gönder
+    void DoSignSend()
+    {
+        string baseUrl = Must(txtServer.Text, "Server URL");
+        string userId  = Must(txtUserId.Text, "userId");
+        string message = Must(txtMessage.Text, "Mesaj");
+        string pin = PromptPin();
+
+        using (var sc = SmartCard.ConnectFirstPresent())
+        {
+            Log("[*] Reader: " + sc.ReaderName);
+            ApduOk(sc.Transmit(new Apdu(0x00,0xA4,0x04,0x00, PivAid)));
+
+            // PIN VERIFY
+            ApduOk(sc.Transmit(new Apdu(0x00, 0x20, 0x00, 0x80, Encoding.ASCII.GetBytes(pin))));
+
+            // İmzala (RSA veya EC — aşağıdaki SignMessage9C her ikisini destekler)
+            byte[] sig = SignMessage9C(sc, Encoding.UTF8.GetBytes(message));
+            string sigB64 = Convert.ToBase64String(sig);
+            Log("[*] Signature (Base64):\r\n" + sigB64);
+
+            string json = "{\"userId\":\""+Esc(userId)+"\",\"message\":\""+Esc(message)+"\",\"signatureBase64\":\""+Esc(sigB64)+"\"}";
+            string resp = HttpPostJson(baseUrl.TrimEnd('/')+"/api/verify", json);
+            Log("[VERIFY] " + resp);
+        }
+    }
+
+    string PromptPin()
+    {
+        var dlg = new Form { Text="PIV PIN", Width=320, Height=140, FormBorderStyle=FormBorderStyle.FixedDialog, StartPosition=FormStartPosition.CenterParent, MaximizeBox=false, MinimizeBox=false };
+        var lbl = new Label { Left=12, Top=15, Width=80, Text="PIN:" };
+        var tb  = new TextBox { Left=90, Top=12, Width=200, UseSystemPasswordChar=true };
+        var ok  = new Button { Left=210, Top=40, Width=80, Text="OK", DialogResult=DialogResult.OK };
+        dlg.Controls.AddRange(new Control[]{lbl,tb,ok});
+        dlg.AcceptButton = ok;
+        if (dlg.ShowDialog(this) != DialogResult.OK) throw new Exception("PIN girilmedi.");
+        if (string.IsNullOrEmpty(tb.Text)) throw new Exception("PIN boş.");
+        return tb.Text;
+    }
+
+    // ================== PIV / APDU FONKSİYONLARI ==================
+
+    static void ApduOk(ApduResponse r)
+    {
+        if (r.SW != 0x9000) throw new Exception("APDU hata: " + r.SW.ToString("X4"));
+    }
+
+    // 9C sertifika GET DATA
     static byte[] GetCert9C(SmartCard sc)
     {
-        // (güvenli) tekrar SELECT PIV
-        ApduOk(sc.Transmit(new Apdu(0x00, 0xA4, 0x04, 0x00, PivAid)));
-
-        // GET DATA: 00 CB 3F FF [ 5C 03 5F C1 0B ]
         byte[] selector = Tlv(0x5C, OidCert9C);
         var resp = sc.Transmit(new Apdu(0x00, 0xCB, 0x3F, 0xFF, selector));
         ApduOk(resp);
-
         byte[] der = TryExtractCertDer(resp.Data);
         if (der == null) throw new Exception("9C sertifikası bulunamadı.");
         return der;
     }
 
-    // ---- RSA doğrulama (local) ----
-    static bool VerifyLocalRsa(X509Certificate2 cert, string message, byte[] sig)
+    // 9C'ye sertifika yaz (PUT DATA 5FC10B)
+    static void PutCertificate9C(SmartCard sc, byte[] certDer)
     {
-        var data = Encoding.UTF8.GetBytes(message);
-
-        var rsaCsp = cert.PublicKey.Key as RSACryptoServiceProvider;
-        if (rsaCsp != null)
+        byte[] cert70 = Tlv(0x70, certDer); // çoğu cihaz için yeterli
+        using (var ms = new MemoryStream())
         {
-            var sha256 = new SHA256CryptoServiceProvider();
-            return rsaCsp.VerifyData(data, sha256, sig);
+            ms.WriteByte(0x5C); ms.WriteByte(0x03); ms.Write(OidCert9C, 0, 3); // selector
+            ms.Write(cert70, 0, cert70.Length);                                 // 70 [DER]
+            var resp = sc.Transmit(new Apdu(0x00, 0xDB, 0x3F, 0xFF, ms.ToArray())); // PUT DATA
+            ApduOk(resp);
         }
-
-        var rsaCng = cert.PublicKey.Key as RSACng;
-        if (rsaCng != null)
-        {
-            return rsaCng.VerifyData(data, sig, HashAlgorithmName.SHA256, RSASignaturePadding.Pkcs1);
-        }
-
-        var rsa = cert.PublicKey.Key as RSA;
-        if (rsa != null)
-        {
-            try { return rsa.VerifyData(data, sig, HashAlgorithmName.SHA256, RSASignaturePadding.Pkcs1); }
-            catch { }
-        }
-        return false;
     }
 
-    // ---- TLV / ASN.1 yardımcıları ----
+    // Admin mutual auth (3DES, default management key)
+    static void PivAdminAuthenticate_TDES(SmartCard sc, byte[] mgmtKey24)
+    {
+        // Witness iste
+        byte[] reqWitness = Tlv(0x7C, new byte[] { 0x80, 0x00 });          // 7C 02 80 00
+        var r1 = sc.Transmit(new Apdu(0x00, 0x87, 0x03, 0x9B, reqWitness)); // P1=03(3DES), P2=9B
+        ApduOk(r1);
+        byte[] witness = ExtractNestedTlv(r1.Data, 0x7C, 0x80);
+        if (witness == null) throw new Exception("admin witness yok");
+
+        // Kart witness decrypt → rndCard
+        byte[] rndCard = Des3EcbDecrypt(witness, mgmtKey24);
+
+        // rndHost
+        byte[] rndHost = new byte[8]; using (var rng = RandomNumberGenerator.Create()) rng.GetBytes(rndHost);
+
+        // Kart randomunun cevabı
+        byte[] respToCard = Des3EcbEncrypt(rndCard, mgmtKey24);
+
+        // 2. adım: host challenge + kart random cevabı
+        using (var inner = new MemoryStream())
+        {
+            byte[] encHost = Des3EcbEncrypt(rndHost, mgmtKey24);
+            inner.WriteByte(0x81); inner.WriteByte((byte)encHost.Length); inner.Write(encHost, 0, encHost.Length);
+            inner.WriteByte(0x82); inner.WriteByte((byte)respToCard.Length); inner.Write(respToCard, 0, respToCard.Length);
+            byte[] gaData = Tlv(0x7C, inner.ToArray());
+            var r2 = sc.Transmit(new Apdu(0x00, 0x87, 0x03, 0x9B, gaData));
+            ApduOk(r2);
+            // kart ENC(rndHost) için cevabı döner → decrypt & karşılaştır
+            byte[] respFromCard = ExtractNestedTlv(r2.Data, 0x7C, 0x82);
+            byte[] dec = Des3EcbDecrypt(respFromCard, mgmtKey24);
+            if (dec.Length != rndHost.Length) throw new Exception("admin auth cevap boyutu geçersiz");
+            for (int i = 0; i < dec.Length; i++) if (dec[i] != rndHost[i]) throw new Exception("admin auth başarısız");
+        }
+    }
+
+    static byte[] Des3EcbEncrypt(byte[] data8, byte[] key24)
+    {
+        using (var tdes = new TripleDESCryptoServiceProvider { Mode = CipherMode.ECB, Padding = PaddingMode.None })
+        using (var enc = tdes.CreateEncryptor(key24, new byte[8]))
+            return enc.TransformFinalBlock(data8, 0, data8.Length);
+    }
+    static byte[] Des3EcbDecrypt(byte[] data8, byte[] key24)
+    {
+        using (var tdes = new TripleDESCryptoServiceProvider { Mode = CipherMode.ECB, Padding = PaddingMode.None })
+        using (var dec = tdes.CreateDecryptor(key24, new byte[8]))
+            return dec.TransformFinalBlock(data8, 0, data8.Length);
+    }
+
+    // 9C RSA2048 anahtar üret & public key al
+    static void GenerateKey9C_RSA2048(SmartCard sc, out byte[] modulus, out byte[] exponent)
+    {
+        // AC: 80 alg(0x07=RSA2048) 84 keySlot(0x9C)
+        byte[] cdata = { 0xAC, 0x03, 0x80, 0x01, 0x07, 0x84, 0x01, 0x9C };
+        var resp = sc.Transmit(new Apdu(0x00, 0x47, 0x00, 0x00, cdata)); // 0x47 GENERATE
+        ApduOk(resp);
+
+        // 7F49 public key template: 81=modulus, 82=exponent
+        byte[] pkTpl = ExtractTlv(resp.Data, 0x7F49);
+        modulus  = ExtractTlv(pkTpl, 0x81);
+        exponent = ExtractTlv(pkTpl, 0x82);
+        if (modulus == null || exponent == null) throw new Exception("Public key alanları eksik.");
+    }
+
+    // Mesaj imzası (RSA veya EC) — GA ile
+    static byte[] SignMessage9C(SmartCard sc, byte[] message)
+    {
+        // Sertifikadan algı tespiti yapmadık; hash seçimini konservatif tut.
+        // RSA için DigestInfo(SHA-256); EC için ham SHA-256 hash
+        // Eğer 9C’de EC P-384 ise burada SHA-384 gerekebilir (gerekirse geliştirebilirsin).
+        byte[] toSign = SHA256.Create().ComputeHash(message);
+        // RSA varsayıyoruz → DigestInfo
+        byte[] digestInfo = BuildDigestInfoSha256(toSign);
+
+        // GA: 7C [ 82 [data] ]
+        byte[] ga = Tlv(0x7C, Tlv(0x82, digestInfo));
+        var r = sc.Transmit(new Apdu(0x00, 0x87, 0x00, Slot9C, ga));
+        ApduOk(r);
+        byte[] sig = ExtractNestedTlv(r.Data, 0x7C, 0x82);
+        if (sig == null) throw new Exception("İmza TLV yok.");
+        return sig;
+    }
+
+    // TBS'i kartla imzalat (RSA PKCS#1 v1.5 + SHA-256)
+    static byte[] SignTbsWithCard_RSA_PKCS1(SmartCard sc, byte[] tbsDer)
+    {
+        byte[] hash = SHA256.Create().ComputeHash(tbsDer);
+        byte[] digestInfo = BuildDigestInfoSha256(hash);
+        byte[] ga = Tlv(0x7C, Tlv(0x82, digestInfo));
+        var r = sc.Transmit(new Apdu(0x00, 0x87, 0x00, Slot9C, ga));
+        ApduOk(r);
+        byte[] sig = ExtractNestedTlv(r.Data, 0x7C, 0x82);
+        if (sig == null) throw new Exception("GA signature yok.");
+        return sig;
+    }
+
+    // ================== X.509 SELF-SIGNED (ASN.1 builder, v1) ==================
+
+    // Basit v1 self-signed sertifika üretir (extensions yok). Alg: sha256WithRSAEncryption.
+    static byte[] BuildSelfSignedCertDer_RSA_SHA256(string subjectCN, byte[] modulus, byte[] exponent, Func<byte[], byte[]> signer)
+    {
+        var asn = new AsnWriter();
+
+        // --- TBSCertificate (v1: version alanını koymuyoruz) ---
+        var tbs = new AsnWriter(); tbs.BeginSeq();
+        // serialNumber (pozitif)
+        byte[] serial = new byte[16]; using (var rng = RandomNumberGenerator.Create()) rng.GetBytes(serial);
+        serial[0] &= 0x7F; if (serial[0] == 0) serial[0] = 1;
+        tbs.WriteInteger(serial);
+
+        // signature AlgorithmIdentifier: sha256WithRSAEncryption (1.2.840.113549.1.1.11) + NULL
+        tbs.BeginSeq();
+        tbs.WriteOid("1.2.840.113549.1.1.11");
+        tbs.WriteNull();
+        tbs.EndSeq();
+
+        // issuer (Name) = CN=subjectCN
+        WriteName_CN(tbs, subjectCN);
+
+        // validity (UTCTime)
+        tbs.BeginSeq();
+        DateTime nb = DateTime.UtcNow.AddMinutes(-1);
+        DateTime na = nb.AddYears(2);
+        tbs.WriteUtcTime(nb);
+        tbs.WriteUtcTime(na);
+        tbs.EndSeq();
+
+        // subject (Name)
+        WriteName_CN(tbs, subjectCN);
+
+        // subjectPublicKeyInfo
+        tbs.BeginSeq();
+        // Algorithm: rsaEncryption + NULL
+        tbs.BeginSeq();
+        tbs.WriteOid("1.2.840.113549.1.1.1");
+        tbs.WriteNull();
+        tbs.EndSeq();
+        // subjectPublicKey (BIT STRING of RSAPublicKey)
+        var rsapub = new AsnWriter(); rsapub.BeginSeq();
+        rsapub.WriteInteger(modulus);
+        rsapub.WriteInteger(exponent);
+        rsapub.EndSeq();
+        tbs.WriteBitString(rsapub.Encode());
+        tbs.EndSeq();
+
+        tbs.EndSeq();
+        byte[] tbsDer = tbs.Encode();
+
+        // signatureValue = sign( SHA256(tbsDer) ) via card
+        byte[] signature = signer(tbsDer);
+
+        // --- Certificate ---
+        asn.BeginSeq();
+        asn.WriteRaw(tbsDer);
+
+        // signatureAlgorithm
+        asn.BeginSeq();
+        asn.WriteOid("1.2.840.113549.1.1.11");
+        asn.WriteNull();
+        asn.EndSeq();
+
+        // signatureValue (BIT STRING)
+        asn.WriteBitString(signature);
+        asn.EndSeq();
+
+        return asn.Encode();
+    }
+
+    static void WriteName_CN(AsnWriter w, string cn)
+    {
+        // Name ::= SEQUENCE OF RDN
+        // RDN ::= SET OF AttributeTypeAndValue
+        // AttributeTypeAndValue ::= SEQUENCE { type (OID = 2.5.4.3), value (UTF8String) }
+        w.BeginSeq();        // Name
+        w.BeginSet();        // RDN
+        w.BeginSeq();        // AttributeTypeAndValue
+        w.WriteOid("2.5.4.3"); // CN
+        w.WriteUtf8String(cn);
+        w.EndSeq();
+        w.EndSet();
+        w.EndSeq();
+    }
+
+    // ================== TLV / ASN.1 / UTIL ==================
+
     static byte[] Tlv(int tag, byte[] value)
     {
         using (var ms = new MemoryStream())
@@ -140,6 +413,7 @@ class Program
         else if (len <= 0xFF) { s.WriteByte(0x81); s.WriteByte((byte)len); }
         else { s.WriteByte(0x82); s.WriteByte((byte)(len >> 8)); s.WriteByte((byte)(len & 0xFF)); }
     }
+
     struct TLV { public int tag; public byte[] val; public TLV(int t, byte[] v){ tag=t; val=v; } }
     static TLV? ReadTlv(byte[] buf, ref int pos)
     {
@@ -181,7 +455,12 @@ class Program
         return null;
     }
 
-    // ASN.1 DigestInfo for SHA-256 (RSA PKCS#1 v1.5)
+    static string ToPem(string kind, byte[] der)
+    {
+        string b64 = Convert.ToBase64String(der, Base64FormattingOptions.InsertLineBreaks);
+        return "-----BEGIN " + kind + "-----\n" + b64 + "\n-----END " + kind + "-----\n";
+    }
+
     static byte[] BuildDigestInfoSha256(byte[] sha256)
     {
         byte[] prefix = {
@@ -195,28 +474,151 @@ class Program
         return result;
     }
 
-    static string ToPem(string kind, byte[] der)
+    static string Esc(string s) { return s.Replace("\\","\\\\").Replace("\"","\\\"").Replace("\r","\\r").Replace("\n","\\n"); }
+
+    static string HttpPostJson(string url, string json)
     {
-        string b64 = Convert.ToBase64String(der, Base64FormattingOptions.InsertLineBreaks);
-        return "-----BEGIN " + kind + "-----\n" + b64 + "\n-----END " + kind + "-----\n";
+        var req = (HttpWebRequest)WebRequest.Create(url);
+        req.Method = "POST";
+        req.ContentType = "application/json; charset=utf-8";
+        var data = Encoding.UTF8.GetBytes(json);
+        using (var os = req.GetRequestStream()) os.Write(data, 0, data.Length);
+        using (var resp = (HttpWebResponse)req.GetResponse())
+        using (var sr = new StreamReader(resp.GetResponseStream(), Encoding.UTF8))
+            return "[HTTP " + (int)resp.StatusCode + "] " + sr.ReadToEnd();
     }
 
-    static void ApduOk(ApduResponse r)
-    {
-        if (r.SW != 0x9000) throw new Exception("APDU hata: " + r.SW.ToString("X4"));
-    }
+    // ================== Mini ASN.1 Writer (yalnızca gereken tipler) ==================
 
-    static string ReadHidden()
+    class AsnWriter
     {
-        var sb = new StringBuilder();
-        for (;;)
+        MemoryStream ms = new MemoryStream();
+
+        public void BeginSeq() { ms.WriteByte(0x30); pushLen(); }
+        public void EndSeq()   { popLen(); }
+        public void BeginSet() { ms.WriteByte(0x31); pushLen(); }
+        public void EndSet()   { popLen(); }
+
+        public void WriteNull() { ms.WriteByte(0x05); ms.WriteByte(0x00); }
+
+        public void WriteInteger(byte[] positiveBigEndian)
         {
-            var k = Console.ReadKey(true);
-            if (k.Key == ConsoleKey.Enter) { Console.WriteLine(); break; }
-            if (k.Key == ConsoleKey.Backspace && sb.Length > 0) { sb.Remove(sb.Length-1,1); continue; }
-            if (!char.IsControl(k.KeyChar)) sb.Append(k.KeyChar);
+            // INTEGER (işaretsiz) → gerekirse başa 0x00 ekle
+            byte[] v = (byte[])positiveBigEndian.Clone();
+            if (v.Length == 0) v = new byte[] { 0x00 };
+            if ((v[0] & 0x80) != 0)
+            {
+                var tmp = new byte[v.Length + 1];
+                tmp[0] = 0x00;
+                Buffer.BlockCopy(v, 0, tmp, 1, v.Length);
+                v = tmp;
+            }
+            ms.WriteByte(0x02);
+            writeLen(v.Length);
+            ms.Write(v, 0, v.Length);
         }
-        return sb.ToString();
+
+        public void WriteBitString(byte[] value)
+        {
+            ms.WriteByte(0x03);
+            writeLen(value.Length + 1);
+            ms.WriteByte(0x00); // unused bits
+            ms.Write(value, 0, value.Length);
+        }
+
+        public void WriteOctetString(byte[] value)
+        {
+            ms.WriteByte(0x04);
+            writeLen(value.Length);
+            ms.Write(value, 0, value.Length);
+        }
+
+        public void WriteOid(string oid)
+        {
+            // basit OID encoder
+            string[] parts = oid.Split('.');
+            int first = int.Parse(parts[0]);
+            int second = int.Parse(parts[1]);
+            using (var tmp = new MemoryStream())
+            {
+                tmp.WriteByte((byte)(first * 40 + second));
+                for (int i = 2; i < parts.Length; i++)
+                {
+                    ulong v = ulong.Parse(parts[i]);
+                    var stack = new System.Collections.Generic.Stack<byte>();
+                    stack.Push((byte)(v & 0x7F));
+                    v >>= 7;
+                    while (v > 0)
+                    {
+                        stack.Push((byte)((v & 0x7F) | 0x80));
+                        v >>= 7;
+                    }
+                    foreach (var b in stack) tmp.WriteByte(b);
+                }
+                byte[] body = tmp.ToArray();
+                ms.WriteByte(0x06);
+                writeLen(body.Length);
+                ms.Write(body, 0, body.Length);
+            }
+        }
+
+        public void WriteUtf8String(string s)
+        {
+            byte[] b = Encoding.UTF8.GetBytes(s);
+            ms.WriteByte(0x0C); // UTF8String
+            writeLen(b.Length);
+            ms.Write(b, 0, b.Length);
+        }
+
+        public void WriteUtcTime(DateTime dtUtc)
+        {
+            // YYMMDDHHMMSSZ (UTC)
+            string s = dtUtc.ToString("yyMMddHHmmss") + "Z";
+            byte[] b = Encoding.ASCII.GetBytes(s);
+            ms.WriteByte(0x17);
+            writeLen(b.Length);
+            ms.Write(b, 0, b.Length);
+        }
+
+        public void WriteRaw(byte[] alreadyEncoded)
+        {
+            ms.Write(alreadyEncoded, 0, alreadyEncoded.Length);
+        }
+
+        // --- length stack ---
+        System.Collections.Generic.Stack<long> lenPos = new System.Collections.Generic.Stack<long>();
+        void pushLen()
+        {
+            lenPos.Push(ms.Position);
+            ms.WriteByte(0x80); // placeholder (indefinite tarzı değil; sonra patch’liyoruz)
+        }
+        void popLen()
+        {
+            long end = ms.Position;
+            long lenPosLoc = lenPos.Pop();
+            // payload = (end - (lenPosLoc+1))
+            long payloadLen = end - (lenPosLoc + 1);
+
+            // payload’ı al
+            ms.Position = lenPosLoc + 1;
+            byte[] payload = new byte[payloadLen];
+            ms.Read(payload, 0, payload.Length);
+
+            // geri dön, uzunluğu yaz, payload’ı tekrar yaz
+            ms.Position = lenPosLoc;
+            byte[] lenEnc = EncodeLen((int)payloadLen);
+            ms.Write(lenEnc, 0, lenEnc.Length);
+            ms.Write(payload, 0, payload.Length);
+        }
+        void writeLen(int len) { byte[] enc = EncodeLen(len); ms.Write(enc, 0, enc.Length); }
+        byte[] EncodeLen(int len)
+        {
+            if (len < 0x80) return new byte[] { (byte)len };
+            if (len <= 0xFF) return new byte[] { 0x81, (byte)len };
+            return new byte[] { 0x82, (byte)(len >> 8), (byte)(len & 0xFF) };
+        }
+
+        public byte[] Encode() { return ms.ToArray(); }
     }
 }
 
@@ -228,7 +630,7 @@ sealed class SmartCard : IDisposable
     uint   _activeProtocol;    // T=0 veya T=1
     string _reader = "";
 
-    public string ReaderName   { get { return _reader; } }
+    public string ReaderName     { get { return _reader; } }
     public uint   ActiveProtocol { get { return _activeProtocol; } }
 
     SmartCard() {}
@@ -240,7 +642,7 @@ sealed class SmartCard : IDisposable
         int rc = WinSCard.SCardEstablishContext(WinSCard.SCARD_SCOPE_USER, IntPtr.Zero, IntPtr.Zero, out sc._ctx);
         Check(rc, "SCardEstablishContext");
 
-        // --- Reader listesi (UNICODE char[] ile) ---
+        // Reader listesi (UNICODE char[] ile)
         uint charCount = 0;
         rc = WinSCard.SCardListReaders(sc._ctx, null, null, ref charCount);
         Check(rc, "SCardListReaders(size)");
@@ -254,7 +656,7 @@ sealed class SmartCard : IDisposable
         var readers = all.Split(new[] { '\0' }, StringSplitOptions.RemoveEmptyEntries);
         if (readers.Length == 0) throw new Exception("Reader bulunamadı.");
 
-        // --- İlk takılı karta bağlan ---
+        // İlk takılı karta bağlan
         foreach (var r in readers)
         {
             IntPtr card; uint proto;
@@ -266,7 +668,7 @@ sealed class SmartCard : IDisposable
             {
                 sc._card = card;
                 sc._reader = r;
-                sc._activeProtocol = proto; // AKTİF PROTOKOLÜ KAYDET
+                sc._activeProtocol = proto;
                 return sc;
             }
         }
@@ -279,14 +681,14 @@ sealed class SmartCard : IDisposable
         byte[] recv = new byte[4096];
 
         var ioSend = new WinSCard.SCARD_IO_REQUEST();
-        ioSend.dwProtocol = _activeProtocol; // T=0/T=1'e göre
+        ioSend.dwProtocol = _activeProtocol;
         ioSend.cbPciLength = (uint)Marshal.SizeOf(typeof(WinSCard.SCARD_IO_REQUEST));
 
         var ioRecv = new WinSCard.SCARD_IO_REQUEST();
         ioRecv.dwProtocol = _activeProtocol;
         ioRecv.cbPciLength = (uint)Marshal.SizeOf(typeof(WinSCard.SCARD_IO_REQUEST));
 
-        uint recvLen = (uint)recv.Length; // ÖNCE kapasiteyi bildir
+        uint recvLen = (uint)recv.Length;
         int rc = WinSCard.SCardTransmit(_card, ref ioSend, send, send.Length, ref ioRecv, recv, out recvLen);
         Check(rc, "SCardTransmit");
 
@@ -338,7 +740,7 @@ struct ApduResponse
 
 static class WinSCard
 {
-    public const int SCARD_S_SUCCESS     = 0;
+    public const int  SCARD_S_SUCCESS     = 0;
     public const uint SCARD_SCOPE_USER   = 0;
     public const uint SCARD_SHARE_SHARED = 2;
     public const uint SCARD_PROTOCOL_T0  = 0x0001;
@@ -358,7 +760,6 @@ static class WinSCard
     [DllImport("winscard.dll", CharSet = CharSet.Unicode)]
     public static extern int SCardReleaseContext(IntPtr hContext);
 
-    // DÜZELTİLMİŞ: char[] buffer + pcchReaders karakter sayısıdır
     [DllImport("winscard.dll", CharSet = CharSet.Unicode)]
     public static extern int SCardListReaders(IntPtr hContext, string mszGroups, char[] mszReaders, ref uint pcchReaders);
 
