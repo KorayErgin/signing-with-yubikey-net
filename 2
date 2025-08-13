@@ -8,9 +8,9 @@ using System.Text;
 class Program
 {
     // ---- PIV sabitleri ----
-    static readonly byte[] PivAid   = { 0xA0,0x00,0x00,0x03,0x08,0x00,0x00,0x10,0x00,0x01,0x00 };
-    const byte Slot9C               = 0x9C;              // Digital Signature
-    static readonly byte[] OidCert9C= { 0x5F, 0xC1, 0x0B }; // GET DATA selector
+    static readonly byte[] PivAid    = { 0xA0,0x00,0x00,0x03,0x08,0x00,0x00,0x10,0x00,0x01,0x00 };
+    const byte Slot9C                = 0x9C;                // Digital Signature
+    static readonly byte[] OidCert9C = { 0x5F, 0xC1, 0x0B }; // GET DATA selector
 
     static void Main()
     {
@@ -18,12 +18,12 @@ class Program
         {
             Console.Write("PIV PIN (örn. 123456): ");
             string pin = ReadHidden();
-
             string message = "imzalanacak metin";
 
             using (var sc = SmartCard.ConnectFirstPresent())
             {
-                Console.WriteLine("[*] Reader: " + sc.ReaderName);
+                Console.WriteLine("[*] Reader : " + sc.ReaderName);
+                Console.WriteLine("[*] Protocol: " + (sc.ActiveProtocol == WinSCard.SCARD_PROTOCOL_T1 ? "T=1" : "T=0"));
 
                 // 1) SELECT PIV
                 ApduOk(sc.Transmit(new Apdu(0x00, 0xA4, 0x04, 0x00, PivAid)));
@@ -31,9 +31,8 @@ class Program
                 // 2) 9C sertifika
                 byte[] certDer = GetCert9C(sc);
                 var cert = new X509Certificate2(certDer);
-                Console.WriteLine("[*] 9C Subject: " + cert.Subject);
-                Console.WriteLine("[*] 9C PublicKey OID: " + cert.PublicKey.Oid.Value);
-
+                Console.WriteLine("[*] 9C Subject       : " + cert.Subject);
+                Console.WriteLine("[*] 9C PublicKey OID : " + cert.PublicKey.Oid.Value);
                 Console.WriteLine("\n----- 9C CERT PEM -----\n" + ToPem("CERTIFICATE", certDer));
 
                 bool isRsa = cert.PublicKey.Oid.Value == "1.2.840.113549.1.1.1"; // rsaEncryption
@@ -50,7 +49,7 @@ class Program
                 }
                 else
                 {
-                    // EC için GA ham hash ister (P-256 varsaydık)
+                    // EC için GA ham hash ister (P-256 varsayıyoruz)
                     dataToSign = SHA256.Create().ComputeHash(Encoding.UTF8.GetBytes(message));
                 }
 
@@ -84,7 +83,7 @@ class Program
     // ---- 9C sertifika GET DATA ----
     static byte[] GetCert9C(SmartCard sc)
     {
-        // SELECT PIV (idempotent)
+        // (güvenli) tekrar SELECT PIV
         ApduOk(sc.Transmit(new Apdu(0x00, 0xA4, 0x04, 0x00, PivAid)));
 
         // GET DATA: 00 CB 3F FF [ 5C 03 5F C1 0B ]
@@ -100,7 +99,6 @@ class Program
     // ---- RSA doğrulama (local) ----
     static bool VerifyLocalRsa(X509Certificate2 cert, string message, byte[] sig)
     {
-        // .NET 4.6’da farklı RSA sağlayıcıları olabilir — sırayla dene
         var data = Encoding.UTF8.GetBytes(message);
 
         var rsaCsp = cert.PublicKey.Key as RSACryptoServiceProvider;
@@ -122,7 +120,6 @@ class Program
             try { return rsa.VerifyData(data, sig, HashAlgorithmName.SHA256, RSASignaturePadding.Pkcs1); }
             catch { }
         }
-
         return false;
     }
 
@@ -223,13 +220,16 @@ class Program
     }
 }
 
-// =================== winscard.dll köprü + APDU tipleri (char[] FIX'li) ===================
+// =================== winscard.dll köprü + APDU tipleri (char[] & proto FIX'li) ===================
 sealed class SmartCard : IDisposable
 {
     IntPtr _ctx;
     IntPtr _card;
+    uint   _activeProtocol;    // T=0 veya T=1
     string _reader = "";
-    public string ReaderName { get { return _reader; } }
+
+    public string ReaderName   { get { return _reader; } }
+    public uint   ActiveProtocol { get { return _activeProtocol; } }
 
     SmartCard() {}
 
@@ -240,13 +240,13 @@ sealed class SmartCard : IDisposable
         int rc = WinSCard.SCardEstablishContext(WinSCard.SCARD_SCOPE_USER, IntPtr.Zero, IntPtr.Zero, out sc._ctx);
         Check(rc, "SCardEstablishContext");
 
-        // --- Reader listesini al (UNICODE char[] ile) ---
+        // --- Reader listesi (UNICODE char[] ile) ---
         uint charCount = 0;
         rc = WinSCard.SCardListReaders(sc._ctx, null, null, ref charCount);
         Check(rc, "SCardListReaders(size)");
         if (charCount == 0) throw new Exception("Reader bulunamadı.");
 
-        var chars = new char[charCount]; // KARAKTER sayısı kadar ayır
+        var chars = new char[charCount];
         rc = WinSCard.SCardListReaders(sc._ctx, null, chars, ref charCount);
         Check(rc, "SCardListReaders");
 
@@ -266,6 +266,7 @@ sealed class SmartCard : IDisposable
             {
                 sc._card = card;
                 sc._reader = r;
+                sc._activeProtocol = proto; // AKTİF PROTOKOLÜ KAYDET
                 return sc;
             }
         }
@@ -278,18 +279,19 @@ sealed class SmartCard : IDisposable
         byte[] recv = new byte[4096];
 
         var ioSend = new WinSCard.SCARD_IO_REQUEST();
-        ioSend.dwProtocol = WinSCard.SCARD_PROTOCOL_T1;
+        ioSend.dwProtocol = _activeProtocol; // T=0/T=1'e göre
         ioSend.cbPciLength = (uint)Marshal.SizeOf(typeof(WinSCard.SCARD_IO_REQUEST));
 
         var ioRecv = new WinSCard.SCARD_IO_REQUEST();
-        ioRecv.dwProtocol = WinSCard.SCARD_PROTOCOL_T1;
+        ioRecv.dwProtocol = _activeProtocol;
         ioRecv.cbPciLength = (uint)Marshal.SizeOf(typeof(WinSCard.SCARD_IO_REQUEST));
 
-        uint recvLen;
+        uint recvLen = (uint)recv.Length; // ÖNCE kapasiteyi bildir
         int rc = WinSCard.SCardTransmit(_card, ref ioSend, send, send.Length, ref ioRecv, recv, out recvLen);
         Check(rc, "SCardTransmit");
 
-        if (recvLen < 2) throw new Exception("APDU cevabı kısa.");
+        if (recvLen < 2) throw new Exception("APDU cevabı kısa (recvLen=" + recvLen + ").");
+
         ushort sw = (ushort)((recv[recvLen - 2] << 8) | recv[recvLen - 1]);
         var data = new byte[recvLen - 2];
         Buffer.BlockCopy(recv, 0, data, 0, data.Length);
@@ -336,12 +338,12 @@ struct ApduResponse
 
 static class WinSCard
 {
-    public const int SCARD_S_SUCCESS = 0;
-    public const uint SCARD_SCOPE_USER = 0;
+    public const int SCARD_S_SUCCESS     = 0;
+    public const uint SCARD_SCOPE_USER   = 0;
     public const uint SCARD_SHARE_SHARED = 2;
-    public const uint SCARD_PROTOCOL_T0 = 0x0001;
-    public const uint SCARD_PROTOCOL_T1 = 0x0002;
-    public const uint SCARD_LEAVE_CARD = 0;
+    public const uint SCARD_PROTOCOL_T0  = 0x0001;
+    public const uint SCARD_PROTOCOL_T1  = 0x0002;
+    public const uint SCARD_LEAVE_CARD   = 0;
 
     [StructLayout(LayoutKind.Sequential)]
     public struct SCARD_IO_REQUEST
@@ -356,7 +358,7 @@ static class WinSCard
     [DllImport("winscard.dll", CharSet = CharSet.Unicode)]
     public static extern int SCardReleaseContext(IntPtr hContext);
 
-    // *** DÜZELTİLMİŞ İMZA: char[] buffer ve pcchReaders = karakter sayısı ***
+    // DÜZELTİLMİŞ: char[] buffer + pcchReaders karakter sayısıdır
     [DllImport("winscard.dll", CharSet = CharSet.Unicode)]
     public static extern int SCardListReaders(IntPtr hContext, string mszGroups, char[] mszReaders, ref uint pcchReaders);
 
