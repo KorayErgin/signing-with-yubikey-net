@@ -1,0 +1,393 @@
+using System;
+using System.IO;
+using System.Runtime.InteropServices;
+using System.Security.Cryptography;
+using System.Security.Cryptography.X509Certificates;
+using System.Text;
+
+class Program
+{
+    // PIV AID (SELECT ile PIV uygulamasını seçmek için)
+    static readonly byte[] PivAid = new byte[] { 0xA0,0x00,0x00,0x03,0x08,0x00,0x00,0x10,0x00,0x01,0x00 };
+    const byte Slot9C = 0x9C;                            // Digital Signature slotu
+    static readonly byte[] OidCert9C = { 0x5F, 0xC1, 0x0B }; // GET DATA selector
+
+    static void Main()
+    {
+        try
+        {
+            Console.Write("PIV PIN (örn. 123456): ");
+            string pin = ReadHidden();
+
+            string message = "imzalanacak metin";
+
+            using (var sc = SmartCard.ConnectFirstPresent())
+            {
+                Console.WriteLine("[*] Reader: " + sc.ReaderName);
+
+                // 1) SELECT PIV
+                ApduOk(sc.Transmit(new Apdu(0x00, 0xA4, 0x04, 0x00, PivAid)));
+
+                // 2) 9C sertifikayı GET DATA ile al
+                byte[] certDer = GetCert9C(sc);
+                var cert = new X509Certificate2(certDer);
+                Console.WriteLine("[*] 9C Subject: " + cert.Subject);
+                Console.WriteLine("[*] 9C PublicKey OID: " + cert.PublicKey.Oid.Value);
+
+                // RSA mı?
+                bool isRsa = cert.PublicKey.Oid.Value == "1.2.840.113549.1.1.1"; // rsaEncryption
+                if (!isRsa)
+                {
+                    Console.WriteLine("UYARI: Bu örnek .NET 4.6’da RSA içindir. 9C EC ise imza atılır fakat lokal doğrulama örneği dahil değil.");
+                }
+
+                Console.WriteLine("\n----- 9C CERT PEM -----\n" + ToPem("CERTIFICATE", certDer));
+
+                // 3) PIN VERIFY (global)
+                ApduOk(sc.Transmit(new Apdu(0x00, 0x20, 0x00, 0x80, Encoding.ASCII.GetBytes(pin))));
+
+                // 4) GENERAL AUTHENTICATE ile imza
+                byte[] dataToSign;
+                if (isRsa)
+                {
+                    byte[] hash = SHA256.Create().ComputeHash(Encoding.UTF8.GetBytes(message));
+                    dataToSign = BuildDigestInfoSha256(hash); // RSA için DigestInfo
+                }
+                else
+                {
+                    // EC için GA ham hash ister: (P-256 varsayıyoruz)
+                    dataToSign = SHA256.Create().ComputeHash(Encoding.UTF8.GetBytes(message));
+                }
+
+                byte[] ga = Tlv(0x7C, Tlv(0x82, dataToSign));
+                var resp = sc.Transmit(new Apdu(0x00, 0x87, 0x00, Slot9C, ga));
+                ApduOk(resp);
+
+                byte[] sig = ExtractNestedTlv(resp.Data, 0x7C, 0x82);
+                if (sig == null) throw new Exception("İmza dönmedi.");
+                string sigB64 = Convert.ToBase64String(sig);
+                Console.WriteLine("\n[*] Signature (Base64):\n" + sigB64);
+
+                // 5) Lokal doğrulama (RSA)
+                if (isRsa)
+                {
+                    bool ok = VerifyLocalRsa(cert, message, sig);
+                    Console.WriteLine("[VERIFY-LOCAL] " + (ok ? "OK" : "FAIL"));
+                }
+                else
+                {
+                    Console.WriteLine("[NOT] EC key: Lokal doğrulama örneği bu projede yok (4.6 sınırlaması).");
+                }
+            }
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine("HATA: " + ex);
+        }
+    }
+
+    // --- 9C sertifika GET DATA ---
+    static byte[] GetCert9C(SmartCard sc)
+    {
+        // SELECT PIV (güvenli taraf)
+        ApduOk(sc.Transmit(new Apdu(0x00, 0xA4, 0x04, 0x00, PivAid)));
+
+        // GET DATA (00 CB 3F FF [5C 03 5F C1 0B])
+        byte[] selector = Tlv(0x5C, OidCert9C);
+        var resp = sc.Transmit(new Apdu(0x00, 0xCB, 0x3F, 0xFF, selector));
+        ApduOk(resp);
+
+        byte[] der = TryExtractCertDer(resp.Data);
+        if (der == null) throw new Exception("9C sertifika bulunamadı.");
+        return der;
+    }
+
+    // --- RSA doğrulama (local) ---
+    static bool VerifyLocalRsa(X509Certificate2 cert, string message, byte[] sig)
+    {
+        // .NET 4.6'da RSACng mevcut (Windows)
+        using (var rsa = cert.PublicKey.Key as RSACryptoServiceProvider)
+        {
+            if (rsa != null)
+            {
+                // CSP ile SHA256 doğrulama:
+                var sha256 = new SHA256CryptoServiceProvider();
+                return rsa.VerifyData(Encoding.UTF8.GetBytes(message), sha256, sig);
+            }
+        }
+        using (var rsa2 = cert.PublicKey.Key as RSACng)
+        {
+            if (rsa2 != null)
+            {
+                return rsa2.VerifyData(Encoding.UTF8.GetBytes(message), sig, HashAlgorithmName.SHA256, RSASignaturePadding.Pkcs1);
+            }
+        }
+        // Fallback: yeni RSA wrapper
+        using (var rsa3 = (RSA)cert.PublicKey.Key)
+        {
+            try { return rsa3.VerifyData(Encoding.UTF8.GetBytes(message), sig, HashAlgorithmName.SHA256, RSASignaturePadding.Pkcs1); }
+            catch { return false; }
+        }
+    }
+
+    // --- TLV/DER yardımcıları ---
+    static byte[] Tlv(int tag, byte[] value)
+    {
+        using (var ms = new MemoryStream())
+        {
+            ms.WriteByte((byte)tag);
+            WriteLen(ms, value.Length);
+            ms.Write(value, 0, value.Length);
+            return ms.ToArray();
+        }
+    }
+    static void WriteLen(Stream s, int len)
+    {
+        if (len < 0x80) s.WriteByte((byte)len);
+        else if (len <= 0xFF) { s.WriteByte(0x81); s.WriteByte((byte)len); }
+        else { s.WriteByte(0x82); s.WriteByte((byte)(len >> 8)); s.WriteByte((byte)(len & 0xFF)); }
+    }
+    static byte[] ExtractNestedTlv(byte[] data, int outerTag, int innerTag)
+    {
+        int p = 0;
+        var outer = ReadTlv(data, ref p);
+        if (outer == null || outer.Value.tag != outerTag) return null;
+        int q = 0; var span = outer.Value.val;
+        while (q < span.Length)
+        {
+            var inner = ReadTlv(span, ref q);
+            if (inner == null) break;
+            if (inner.Value.tag == innerTag) return inner.Value.val;
+        }
+        return null;
+    }
+    static byte[] TryExtractCertDer(byte[] resp)
+    {
+        int p = 0;
+        var t = ReadTlv(resp, ref p);
+        if (t == null) return null;
+        if (t.Value.tag == 0x70) return t.Value.val;                // doğrudan DER
+        int q = 0;
+        var t2 = ReadTlv(t.Value.val, ref q);
+        if (t2 != null && t2.Value.tag == 0x70) return t2.Value.val;
+        return null;
+    }
+    struct TLV { public int tag; public byte[] val; public TLV(int t, byte[] v){ tag=t; val=v; } }
+    static TLV? ReadTlv(byte[] buf, ref int pos)
+    {
+        if (pos >= buf.Length) return null;
+        int tag = buf[pos++] & 0xFF;
+        if (pos >= buf.Length) return null;
+        int len = buf[pos++] & 0xFF;
+        if (len == 0x81) { if (pos >= buf.Length) return null; len = buf[pos++] & 0xFF; }
+        else if (len == 0x82) { if (pos + 1 >= buf.Length) return null; len = (buf[pos++] << 8) | buf[pos++]; }
+        else if (len >= 0x80) throw new Exception("Desteklenmeyen length formu");
+        if (pos + len > buf.Length) return null;
+        var val = new byte[len];
+        Buffer.BlockCopy(buf, pos, val, 0, len);
+        pos += len;
+        return new TLV(tag, val);
+    }
+
+    // ASN.1 DigestInfo (SHA-256) — RSA PKCS#1 v1.5 için
+    static byte[] BuildDigestInfoSha256(byte[] sha256)
+    {
+        byte[] prefix = new byte[] {
+            0x30,0x31, 0x30,0x0d,
+            0x06,0x09,0x60,0x86,0x48,0x01,0x65,0x03,0x04,0x02,0x01,
+            0x05,0x00, 0x04,0x20
+        };
+        var result = new byte[prefix.Length + sha256.Length];
+        Buffer.BlockCopy(prefix, 0, result, 0, prefix.Length);
+        Buffer.BlockCopy(sha256, 0, result, prefix.Length, sha256.Length);
+        return result;
+    }
+
+    static string ToPem(string kind, byte[] der)
+    {
+        string b64 = Convert.ToBase64String(der, Base64FormattingOptions.InsertLineBreaks);
+        return "-----BEGIN " + kind + "-----\n" + b64 + "\n-----END " + kind + "-----\n";
+    }
+
+    static void ApduOk(ApduResponse r)
+    {
+        if (r.SW != 0x9000) throw new Exception("APDU hata: " + r.SW.ToString("X4"));
+    }
+
+    static string ReadHidden()
+    {
+        var sb = new StringBuilder();
+        for (;;)
+        {
+            var key = Console.ReadKey(true);
+            if (key.Key == ConsoleKey.Enter) { Console.WriteLine(); break; }
+            if (key.Key == ConsoleKey.Backspace && sb.Length > 0) { sb.Remove(sb.Length-1,1); continue; }
+            if (!char.IsControl(key.KeyChar)) sb.Append(key.KeyChar);
+        }
+        return sb.ToString();
+    }
+}
+
+// -------- winscard.dll köprü + APDU basit tipleri (.NET 4.6 uyumlu) --------
+sealed class SmartCard : IDisposable
+{
+    IntPtr _ctx;
+    IntPtr _card;
+    string _reader = "";
+    public string ReaderName { get { return _reader; } }
+
+    SmartCard() {}
+
+    public static SmartCard ConnectFirstPresent()
+    {
+        var sc = new SmartCard();
+
+        int rc = WinSCard.SCardEstablishContext(WinSCard.SCARD_SCOPE_USER, IntPtr.Zero, IntPtr.Zero, out sc._ctx);
+        Check(rc, "SCardEstablishContext");
+
+        // okuyucuları al
+        uint sz = 0;
+        rc = WinSCard.SCardListReaders(sc._ctx, null, null, ref sz);
+        Check(rc, "SCardListReaders(size)");
+        var buf = new byte[sz];
+        rc = WinSCard.SCardListReaders(sc._ctx, null, buf, ref sz);
+        Check(rc, "SCardListReaders");
+
+        var readers = MultiStringToList(buf);
+        if (readers.Count == 0) throw new Exception("Reader bulunamadı.");
+
+        // ilk takılı karta bağlan
+        foreach (var r in readers)
+        {
+            IntPtr card; uint proto;
+            rc = WinSCard.SCardConnect(sc._ctx, r, WinSCard.SCARD_SHARE_SHARED,
+                                       WinSCard.SCARD_PROTOCOL_T0 | WinSCard.SCARD_PROTOCOL_T1,
+                                       out card, out proto);
+            if (rc == WinSCard.SCARD_S_SUCCESS)
+            {
+                sc._card = card;
+                sc._reader = r;
+                return sc;
+            }
+        }
+        throw new Exception("Kart takılı reader bulunamadı.");
+    }
+
+    public ApduResponse Transmit(Apdu apdu)
+    {
+        byte[] send = apdu.ToArray();
+        byte[] recv = new byte[4096];
+
+        var ioSend = new WinSCard.SCARD_IO_REQUEST();
+        ioSend.dwProtocol = WinSCard.SCARD_PROTOCOL_T1;
+        ioSend.cbPciLength = (uint)Marshal.SizeOf(typeof(WinSCard.SCARD_IO_REQUEST));
+
+        var ioRecv = new WinSCard.SCARD_IO_REQUEST();
+        ioRecv.dwProtocol = WinSCard.SCARD_PROTOCOL_T1;
+        ioRecv.cbPciLength = (uint)Marshal.SizeOf(typeof(WinSCard.SCARD_IO_REQUEST));
+
+        uint recvLen;
+        int rc = WinSCard.SCardTransmit(_card, ref ioSend, send, send.Length, ref ioRecv, recv, out recvLen);
+        Check(rc, "SCardTransmit");
+
+        if (recvLen < 2) throw new Exception("APDU cevabı kısa.");
+        ushort sw = (ushort)((recv[recvLen - 2] << 8) | recv[recvLen - 1]);
+        var data = new byte[recvLen - 2];
+        Buffer.BlockCopy(recv, 0, data, 0, data.Length);
+        return new ApduResponse(data, sw);
+    }
+
+    public void Dispose()
+    {
+        if (_card != IntPtr.Zero) { WinSCard.SCardDisconnect(_card, WinSCard.SCARD_LEAVE_CARD); _card = IntPtr.Zero; }
+        if (_ctx  != IntPtr.Zero) { WinSCard.SCardReleaseContext(_ctx); _ctx = IntPtr.Zero; }
+    }
+
+    static void Check(int rc, string where)
+    {
+        if (rc != WinSCard.SCARD_S_SUCCESS)
+            throw new System.ComponentModel.Win32Exception(rc, where + " failed: 0x" + rc.ToString("X"));
+    }
+
+    static System.Collections.Generic.List<string> MultiStringToList(byte[] multiSz)
+    {
+        var list = new System.Collections.Generic.List<string>();
+        int i = 0;
+        while (i < multiSz.Length)
+        {
+            int start = i;
+            while (i < multiSz.Length && multiSz[i] != 0) i++;
+            int len = i - start;
+            if (len == 0) break;
+            // UNICODE multistring (Windows)
+            string s = Encoding.Unicode.GetString(multiSz, start, len);
+            list.Add(s);
+            i++;
+        }
+        return list;
+    }
+}
+
+struct Apdu
+{
+    public byte Cla, Ins, P1, P2;
+    public byte[] Data;
+    public Apdu(byte cla, byte ins, byte p1, byte p2, byte[] data = null)
+    {
+        Cla = cla; Ins = ins; P1 = p1; P2 = p2; Data = data;
+    }
+    public byte[] ToArray()
+    {
+        if (Data == null || Data.Length == 0)
+            return new byte[] { Cla, Ins, P1, P2, 0x00 };
+        byte[] apdu = new byte[5 + Data.Length];
+        apdu[0] = Cla; apdu[1] = Ins; apdu[2] = P1; apdu[3] = P2; apdu[4] = (byte)Data.Length;
+        Buffer.BlockCopy(Data, 0, apdu, 5, Data.Length);
+        return apdu;
+    }
+}
+struct ApduResponse
+{
+    public byte[] Data;
+    public ushort SW;
+    public ApduResponse(byte[] d, ushort sw) { Data = d; SW = sw; }
+}
+
+static class WinSCard
+{
+    public const int SCARD_S_SUCCESS = 0;
+    public const uint SCARD_SCOPE_USER = 0;
+    public const uint SCARD_SHARE_SHARED = 2;
+    public const uint SCARD_PROTOCOL_T0 = 0x0001;
+    public const uint SCARD_PROTOCOL_T1 = 0x0002;
+    public const uint SCARD_LEAVE_CARD = 0;
+
+    [StructLayout(LayoutKind.Sequential)]
+    public struct SCARD_IO_REQUEST
+    {
+        public uint dwProtocol;
+        public uint cbPciLength;
+    }
+
+    [DllImport("winscard.dll", CharSet = CharSet.Unicode)]
+    public static extern int SCardEstablishContext(uint dwScope, IntPtr notUsed1, IntPtr notUsed2, out IntPtr phContext);
+
+    [DllImport("winscard.dll", CharSet = CharSet.Unicode)]
+    public static extern int SCardReleaseContext(IntPtr hContext);
+
+    [DllImport("winscard.dll", CharSet = CharSet.Unicode)]
+    public static extern int SCardListReaders(IntPtr hContext, string mszGroups, byte[] mszReaders, ref uint pcchReaders);
+
+    [DllImport("winscard.dll", CharSet = CharSet.Unicode)]
+    public static extern int SCardConnect(IntPtr hContext, string szReader, uint dwShareMode, uint dwPreferredProtocols,
+                                          out IntPtr phCard, out uint pdwActiveProtocol);
+
+    [DllImport("winscard.dll", CharSet = CharSet.Unicode)]
+    public static extern int SCardDisconnect(IntPtr hCard, uint dwDisposition);
+
+    [DllImport("winscard.dll", CharSet = CharSet.Unicode)]
+    public static extern int SCardTransmit(IntPtr hCard, ref SCARD_IO_REQUEST pioSendPci,
+                                           byte[] pbSendBuffer, int cbSendLength,
+                                           ref SCARD_IO_REQUEST pioRecvPci,
+                                           byte[] pbRecvBuffer, out uint pcbRecvLength);
+}
